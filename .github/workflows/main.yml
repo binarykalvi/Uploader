@@ -1,0 +1,227 @@
+name: Uploader
+
+on:
+  repository_dispatch:
+    types: [Uploader]
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Disk Space for Large Files
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install System Dependencies & MEGA CMD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git ffmpeg wget jq
+          
+          # Install MEGA CMD quietly to avoid log spam
+          wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
+          sudo apt-get install -y ./megacmd-xUbuntu_22.04_amd64.deb > /dev/null 2>&1
+          rm megacmd-xUbuntu_22.04_amd64.deb
+
+          pip install requests > /dev/null 2>&1
+          npm install googleapis > /dev/null 2>&1
+
+      - name: Download and Reassemble Video Chunks
+        env:
+          VIDEO_URLS: "${{ github.event.client_payload.video_urls }}"
+          TARGET_FILENAME: "${{ github.event.client_payload.filename }}"
+          VIDEO_TITLE: "${{ github.event.client_payload.title }}"
+          YOUTUBE_CLIENT_ID: "${{ secrets.YOUTUBE_CLIENT_ID }}"
+          YOUTUBE_CLIENT_SECRET: "${{ secrets.YOUTUBE_CLIENT_SECRET }}"
+          YOUTUBE_REFRESH_TOKEN: "${{ secrets.YOUTUBE_REFRESH_TOKEN }}"
+          VIDEO_DESCRIPTION: "${{ secrets.VIDEO_DESCRIPTION }}"
+          VIDEO_VISIBILITY: "${{ secrets.VIDEO_VISIBILITY }}"
+          MEGA_EMAIL: "${{ secrets.MEGA_EMAIL }}"
+          MEGA_PASSWORD: "${{ secrets.MEGA_PASSWORD }}"
+          MEGA_EMAIL_2: "${{ secrets.MEGA_EMAIL_2 }}"
+          MEGA_PASSWORD_2: "${{ secrets.MEGA_PASSWORD_2 }}"
+          MEGA_EMAIL_3: "${{ secrets.MEGA_EMAIL_3 }}"
+          MEGA_PASSWORD_3: "${{ secrets.MEGA_PASSWORD_3 }}"
+          MEGA_EMAIL_4: "${{ secrets.MEGA_EMAIL_4 }}"
+          MEGA_PASSWORD_4: "${{ secrets.MEGA_PASSWORD_4 }}"
+          MEGA_EMAIL_5: "${{ secrets.MEGA_EMAIL_5 }}"
+          MEGA_PASSWORD_5: "${{ secrets.MEGA_PASSWORD_5 }}"
+          TERM: "xterm"
+        run: |
+          mkdir -p downloads
+
+          if [ -z "$VIDEO_URLS" ]; then
+            echo "::error::No VIDEO_URLS provided in payload."
+            exit 1
+          fi
+
+          echo "Downloading parts..."
+          IFS=',' read -ra URL_ARRAY <<< "$VIDEO_URLS"
+          
+          for url in "${URL_ARRAY[@]}"; do
+            part_name=$(basename "$url")
+            echo "Downloading: $part_name"
+            # Use --no-verbose to prevent wget progress-bar line spam in logs
+            wget --no-verbose -O "downloads/$part_name" "$url"
+          done
+
+          # Combine all parts back into the single final video file safely using a robust loop
+          echo "Combining video chunks..."
+          cd downloads
+          
+          rm -f "$TARGET_FILENAME"
+          for f in $(ls -v | grep "part"); do
+            echo "Appending $f..."
+            cat "$f" >> "$TARGET_FILENAME"
+          done
+          
+          cd ..
+
+          DOWNLOADED_FILE="downloads/$TARGET_FILENAME"
+
+          if [ ! -f "$DOWNLOADED_FILE" ]; then
+            echo "::error::Reassembly failed. File not found."
+            exit 1
+          fi
+
+          echo "File reassembled successfully: $DOWNLOADED_FILE ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
+          echo "Attempting YouTube upload..."
+
+          node -e '
+          const { execSync } = require("child_process");
+          const fs = require("fs");
+          const path = require("path");
+          const { google } = require("googleapis");
+
+          async function uploadToMega(filePath) {
+            console.log("\n--- Triggering Multi-Account MEGA Fallback Upload ---");
+            const megaAccounts = [
+              { email: process.env.MEGA_EMAIL, pass: process.env.MEGA_PASSWORD },
+              { email: process.env.MEGA_EMAIL_2, pass: process.env.MEGA_PASSWORD_2 },
+              { email: process.env.MEGA_EMAIL_3, pass: process.env.MEGA_PASSWORD_3 },
+              { email: process.env.MEGA_EMAIL_4, pass: process.env.MEGA_PASSWORD_4 },
+              { email: process.env.MEGA_EMAIL_5, pass: process.env.MEGA_PASSWORD_5 }
+            ].filter(acc => acc.email && acc.pass);
+
+            if (megaAccounts.length === 0) {
+              console.error("Error: No valid MEGA account credentials found.");
+              process.exit(1);
+            }
+
+            for (let i = 0; i < megaAccounts.length; i++) {
+              const acc = megaAccounts[i];
+              try {
+                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                execSync(`mega-login "${acc.email}" "${acc.pass}"`, { stdio: "inherit" });
+                execSync(`mega-put "${filePath}" /`, { stdio: "inherit" });
+                console.log(`MEGA Upload Completed Successfully on Account #${i + 1}!`);
+                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                return;
+              } catch (err) {
+                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                if (i === megaAccounts.length - 1) process.exit(1);
+              }
+            }
+          }
+
+          async function uploadVideo() {
+            const clientId = process.env.YOUTUBE_CLIENT_ID;
+            const clientSecret = process.env.YOUTUBE_CLIENT_SECRET;
+            const refreshToken = process.env.YOUTUBE_REFRESH_TOKEN;
+
+            const filePath = path.join(__dirname, "downloads", process.env.TARGET_FILENAME || "");
+            const fileSize = fs.statSync(filePath).size;
+            console.log(`Starting YouTube Upload: (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
+
+            if (!clientId || !clientSecret || !refreshToken) {
+              await uploadToMega(filePath);
+              return;
+            }
+
+            const oauth2Client = new google.auth.OAuth2(clientId, clientSecret);
+            oauth2Client.setCredentials({ refresh_token: refreshToken });
+            const youtube = google.youtube({ version: "v3", auth: oauth2Client });
+
+            let lastPrinted = -1;
+
+            try {
+              const response = await youtube.videos.insert(
+                {
+                  part: "snippet,status",
+                  requestBody: {
+                    snippet: {
+                      title: process.env.VIDEO_TITLE,
+                      description: process.env.VIDEO_DESCRIPTION || "Automated Upload",
+                      categoryId: "27",
+                    },
+                    status: { privacyStatus: process.env.VIDEO_VISIBILITY || "unlisted" },
+                  },
+                  media: { body: fs.createReadStream(filePath) },
+                },
+                {
+                  onUploadProgress: (evt) => {
+                    const progress = Math.floor((evt.bytesRead / fileSize) * 100);
+                    // Log only every 5% increment to keep logs clean and prevent truncation
+                    if (progress > lastPrinted && progress % 5 === 0) {
+                      console.log(`Uploading to YouTube... ${progress}%`);
+                      lastPrinted = progress;
+                    }
+                  },
+                }
+              );
+              console.log(`YouTube Upload Complete! Video ID: ${response.data.id}`);
+            } catch (error) {
+              console.error("\nYouTube Upload Failed:", error.message);
+              await uploadToMega(filePath);
+            }
+          }
+          uploadVideo();
+          '
+
+      - name: Cleanup GitHub Release
+        if: always()
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          VIDEO_URLS: "${{ github.event.client_payload.video_urls }}"
+        run: |
+          if [ -z "$VIDEO_URLS" ]; then
+            exit 0
+          fi
+          
+          IFS=',' read -ra URL_ARRAY <<< "$VIDEO_URLS"
+          TAG_NAME=$(echo "${URL_ARRAY[0]}" | awk -F'/' '{print $8}')
+          
+          if [ -z "$TAG_NAME" ]; then
+            exit 0
+          fi
+
+          REPO="${{ github.repository }}"
+          RELEASE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG_NAME" | jq -r '.id')
+
+          if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/$RELEASE_ID"
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/git/refs/tags/$TAG_NAME"
+            echo "Cleanup completed successfully!"
+          fi
