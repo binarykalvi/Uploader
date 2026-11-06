@@ -32,16 +32,12 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Install System Dependencies & MEGA CMD
+      # NOTE: MEGA CMD is intentionally NOT installed here.
+      # It will only be installed on-demand if YouTube upload fails.
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git ffmpeg wget jq
-          
-          # Install MEGA CMD quietly to avoid log spam
-          wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
-          sudo apt-get install -y ./megacmd-xUbuntu_22.04_amd64.deb > /dev/null 2>&1
-          rm megacmd-xUbuntu_22.04_amd64.deb
-
           pip install requests > /dev/null 2>&1
           npm install googleapis > /dev/null 2>&1
 
@@ -76,24 +72,22 @@ jobs:
 
           echo "Downloading parts..."
           IFS=',' read -ra URL_ARRAY <<< "$VIDEO_URLS"
-          
+
           for url in "${URL_ARRAY[@]}"; do
             part_name=$(basename "$url")
             echo "Downloading: $part_name"
-            # Use --no-verbose to prevent wget progress-bar line spam in logs
             wget --no-verbose -O "downloads/$part_name" "$url"
           done
 
-          # Combine all parts back into the single final video file safely using a robust loop
           echo "Combining video chunks..."
           cd downloads
-          
+
           rm -f "$TARGET_FILENAME"
           for f in $(ls -v | grep "part"); do
             echo "Appending $f..."
             cat "$f" >> "$TARGET_FILENAME"
           done
-          
+
           cd ..
 
           DOWNLOADED_FILE="downloads/$TARGET_FILENAME"
@@ -112,8 +106,37 @@ jobs:
           const path = require("path");
           const { google } = require("googleapis");
 
+          // Installs MEGA CMD only when needed (called from uploadToMega)
+          function installMegaCmd() {
+            try {
+              execSync("which mega-login", { stdio: "ignore" });
+              console.log("MEGA CMD already installed, skipping install.");
+              return;
+            } catch (e) {
+              // not installed, proceed
+            }
+
+            console.log("Installing MEGA CMD (on-demand)...");
+            try {
+              execSync(
+                "wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O /tmp/megacmd.deb",
+                { stdio: "inherit" }
+              );
+              execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "inherit" });
+              execSync("rm -f /tmp/megacmd.deb", { stdio: "ignore" });
+              console.log("MEGA CMD installed successfully.");
+            } catch (err) {
+              console.error("Failed to install MEGA CMD:", err.message);
+              throw err;
+            }
+          }
+
           async function uploadToMega(filePath) {
             console.log("\n--- Triggering Multi-Account MEGA Fallback Upload ---");
+
+            // Install MEGA only now (YouTube upload failed or creds missing)
+            installMegaCmd();
+
             const megaAccounts = [
               { email: process.env.MEGA_EMAIL, pass: process.env.MEGA_PASSWORD },
               { email: process.env.MEGA_EMAIL_2, pass: process.env.MEGA_PASSWORD_2 },
@@ -153,6 +176,7 @@ jobs:
             console.log(`Starting YouTube Upload: (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
 
             if (!clientId || !clientSecret || !refreshToken) {
+              console.log("YouTube credentials missing — going straight to MEGA fallback.");
               await uploadToMega(filePath);
               return;
             }
@@ -180,7 +204,6 @@ jobs:
                 {
                   onUploadProgress: (evt) => {
                     const progress = Math.floor((evt.bytesRead / fileSize) * 100);
-                    // Log only every 5% increment to keep logs clean and prevent truncation
                     if (progress > lastPrinted && progress % 5 === 0) {
                       console.log(`Uploading to YouTube... ${progress}%`);
                       lastPrinted = progress;
@@ -206,10 +229,10 @@ jobs:
           if [ -z "$VIDEO_URLS" ]; then
             exit 0
           fi
-          
+
           IFS=',' read -ra URL_ARRAY <<< "$VIDEO_URLS"
           TAG_NAME=$(echo "${URL_ARRAY[0]}" | awk -F'/' '{print $8}')
-          
+
           if [ -z "$TAG_NAME" ]; then
             exit 0
           fi
