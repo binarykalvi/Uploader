@@ -86,10 +86,29 @@ jobs:
           cd downloads
 
           rm -f "$TARGET_FILENAME"
-          for f in $(ls -v | grep "part"); do
+
+          # ---- Build the list of files to concatenate ----
+          # If any file name contains "part", treat them as the chunks.
+          # Otherwise (single-file payload, e.g. 2151bdc7.mp4), use everything.
+          if ls -1 | grep -q "part"; then
+            FILES=$(ls -v | grep "part")
+          else
+            FILES=$(ls -v)
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "::error::No files found in downloads directory to combine."
+            ls -la
+            exit 1
+          fi
+
+          # Concatenate in version-sorted order; skip the target if it already exists
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ "$f" = "$TARGET_FILENAME" ] && continue
             echo "Appending $f..."
             cat "$f" >> "$TARGET_FILENAME"
-          done
+          done <<< "$FILES"
 
           cd ..
 
@@ -97,6 +116,7 @@ jobs:
 
           if [ ! -f "$DOWNLOADED_FILE" ]; then
             echo "::error::Reassembly failed. File not found."
+            ls -la downloads || true
             exit 1
           fi
 
@@ -119,16 +139,12 @@ jobs:
               return;
             } catch (e) {}
 
-            try {
-              execSync(
-                "wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O /tmp/megacmd.deb",
-                { stdio: "ignore" }
-              );
-              execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "ignore" });
-              execSync("rm -f /tmp/megacmd.deb", { stdio: "ignore" });
-            } catch (err) {
-              throw err;
-            }
+            execSync(
+              "wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O /tmp/megacmd.deb",
+              { stdio: "ignore" }
+            );
+            execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "ignore" });
+            execSync("rm -f /tmp/megacmd.deb", { stdio: "ignore" });
           }
 
           async function uploadToMega(filePath) {
@@ -225,7 +241,7 @@ jobs:
                   `You can re-download the video from the link above.\n`,
               });
             } catch (err) {
-              // swallow email errors — no logging
+              // swallow email errors
             }
           }
 
