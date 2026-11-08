@@ -32,14 +32,12 @@ jobs:
         with:
           node-version: '18'
 
-      # NOTE: MEGA CMD is intentionally NOT installed here.
-      # It will only be installed on-demand if YouTube upload fails.
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git ffmpeg wget jq
           pip install requests > /dev/null 2>&1
-          npm install googleapis > /dev/null 2>&1
+          npm install googleapis axios form-data nodemailer > /dev/null 2>&1
 
       - name: Download and Reassemble Video Chunks
         env:
@@ -61,6 +59,11 @@ jobs:
           MEGA_PASSWORD_4: "${{ secrets.MEGA_PASSWORD_4 }}"
           MEGA_EMAIL_5: "${{ secrets.MEGA_EMAIL_5 }}"
           MEGA_PASSWORD_5: "${{ secrets.MEGA_PASSWORD_5 }}"
+          GOFILE_API_TOKEN: "${{ secrets.GOFILE_API_TOKEN }}"
+          GOFILE_FOLDER_ID: "${{ secrets.GOFILE_FOLDER_ID }}"
+          GMAIL_USER: "${{ secrets.GMAIL_USER }}"
+          GMAIL_APP_PASSWORD: "${{ secrets.GMAIL_APP_PASSWORD }}"
+          EMAIL_TO: "${{ secrets.EMAIL_TO }}"
           TERM: "xterm"
         run: |
           mkdir -p downloads
@@ -104,37 +107,31 @@ jobs:
           const { execSync } = require("child_process");
           const fs = require("fs");
           const path = require("path");
+          const axios = require("axios");
+          const FormData = require("form-data");
+          const nodemailer = require("nodemailer");
           const { google } = require("googleapis");
 
-          // Installs MEGA CMD only when needed (called from uploadToMega)
+          // ---------- MEGA fallback ----------
           function installMegaCmd() {
             try {
               execSync("which mega-login", { stdio: "ignore" });
-              console.log("MEGA CMD already installed, skipping install.");
               return;
-            } catch (e) {
-              // not installed, proceed
-            }
+            } catch (e) {}
 
-            console.log("Installing MEGA CMD (on-demand)...");
             try {
               execSync(
                 "wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O /tmp/megacmd.deb",
-                { stdio: "inherit" }
+                { stdio: "ignore" }
               );
-              execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "inherit" });
+              execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "ignore" });
               execSync("rm -f /tmp/megacmd.deb", { stdio: "ignore" });
-              console.log("MEGA CMD installed successfully.");
             } catch (err) {
-              console.error("Failed to install MEGA CMD:", err.message);
               throw err;
             }
           }
 
           async function uploadToMega(filePath) {
-            console.log("\n--- Triggering Multi-Account MEGA Fallback Upload ---");
-
-            // Install MEGA only now (YouTube upload failed or creds missing)
             installMegaCmd();
 
             const megaAccounts = [
@@ -145,39 +142,105 @@ jobs:
               { email: process.env.MEGA_EMAIL_5, pass: process.env.MEGA_PASSWORD_5 }
             ].filter(acc => acc.email && acc.pass);
 
-            if (megaAccounts.length === 0) {
-              console.error("Error: No valid MEGA account credentials found.");
-              process.exit(1);
-            }
+            if (megaAccounts.length === 0) return;
 
             for (let i = 0; i < megaAccounts.length; i++) {
               const acc = megaAccounts[i];
               try {
                 try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
-                execSync(`mega-login "${acc.email}" "${acc.pass}"`, { stdio: "inherit" });
-                execSync(`mega-put "${filePath}" /`, { stdio: "inherit" });
-                console.log(`MEGA Upload Completed Successfully on Account #${i + 1}!`);
+                execSync(`mega-login "${acc.email}" "${acc.pass}"`, { stdio: "ignore" });
+                execSync(`mega-put "${filePath}" /`, { stdio: "ignore" });
                 try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
                 return;
               } catch (err) {
                 try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
-                if (i === megaAccounts.length - 1) process.exit(1);
               }
             }
           }
 
+          // ---------- Gofile upload (token-authenticated) + email ----------
+          async function uploadToGofileAndEmail(filePath) {
+            const gofileToken  = process.env.GOFILE_API_TOKEN;
+            const gofileFolder = process.env.GOFILE_FOLDER_ID || "";
+
+            if (!gofileToken) return;
+
+            let downloadPage = null;
+            let shareCode    = null;
+
+            try {
+              const form = new FormData();
+              form.append("file", fs.createReadStream(filePath));
+              form.append("token", gofileToken);
+              if (gofileFolder) form.append("folderId", gofileFolder);
+
+              const headers = form.getHeaders();
+              headers["Authorization"] = `Bearer ${gofileToken}`;
+
+              const res = await axios.post(
+                "https://upload.gofile.io/uploadfile",
+                form,
+                {
+                  headers,
+                  maxBodyLength: Infinity,
+                  maxContentLength: Infinity,
+                  timeout: 0,
+                }
+              );
+
+              if (!res.data || res.data.status !== "ok") return;
+
+              downloadPage = res.data.data?.downloadPage;
+              shareCode    = res.data.data?.code;
+              if (!downloadPage) return;
+            } catch (err) {
+              return;
+            }
+
+            const gmailUser = process.env.GMAIL_USER;
+            const gmailPass = process.env.GMAIL_APP_PASSWORD;
+            const emailTo   = process.env.EMAIL_TO;
+
+            if (!gmailUser || !gmailPass || !emailTo) return;
+
+            try {
+              const transporter = nodemailer.createTransport({
+                service: "gmail",
+                auth: { user: gmailUser, pass: gmailPass },
+              });
+
+              const sizeMB   = (fs.statSync(filePath).size / 1024 / 1024).toFixed(2);
+              const fileName = path.basename(filePath);
+
+              await transporter.sendMail({
+                from: gmailUser,
+                to: emailTo,
+                subject: `Video Fallback Upload – ${fileName}`,
+                text:
+                  `YouTube upload failed, but the video was uploaded to Gofile.\n\n` +
+                  `File      : ${fileName}\n` +
+                  `Size      : ${sizeMB} MB\n` +
+                  `Share code: ${shareCode || "n/a"}\n` +
+                  `Link      : ${downloadPage}\n\n` +
+                  `You can re-download the video from the link above.\n`,
+              });
+            } catch (err) {
+              // swallow email errors — no logging
+            }
+          }
+
+          // ---------- YouTube upload ----------
           async function uploadVideo() {
-            const clientId = process.env.YOUTUBE_CLIENT_ID;
+            const clientId     = process.env.YOUTUBE_CLIENT_ID;
             const clientSecret = process.env.YOUTUBE_CLIENT_SECRET;
             const refreshToken = process.env.YOUTUBE_REFRESH_TOKEN;
 
             const filePath = path.join(__dirname, "downloads", process.env.TARGET_FILENAME || "");
             const fileSize = fs.statSync(filePath).size;
-            console.log(`Starting YouTube Upload: (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
 
             if (!clientId || !clientSecret || !refreshToken) {
-              console.log("YouTube credentials missing — going straight to MEGA fallback.");
               await uploadToMega(filePath);
+              await uploadToGofileAndEmail(filePath);
               return;
             }
 
@@ -185,10 +248,8 @@ jobs:
             oauth2Client.setCredentials({ refresh_token: refreshToken });
             const youtube = google.youtube({ version: "v3", auth: oauth2Client });
 
-            let lastPrinted = -1;
-
             try {
-              const response = await youtube.videos.insert(
+              await youtube.videos.insert(
                 {
                   part: "snippet,status",
                   requestBody: {
@@ -202,21 +263,15 @@ jobs:
                   media: { body: fs.createReadStream(filePath) },
                 },
                 {
-                  onUploadProgress: (evt) => {
-                    const progress = Math.floor((evt.bytesRead / fileSize) * 100);
-                    if (progress > lastPrinted && progress % 5 === 0) {
-                      console.log(`Uploading to YouTube... ${progress}%`);
-                      lastPrinted = progress;
-                    }
-                  },
+                  onUploadProgress: () => {},
                 }
               );
-              console.log(`YouTube Upload Complete! Video ID: ${response.data.id}`);
             } catch (error) {
-              console.error("\nYouTube Upload Failed:", error.message);
               await uploadToMega(filePath);
+              await uploadToGofileAndEmail(filePath);
             }
           }
+
           uploadVideo();
           '
 
