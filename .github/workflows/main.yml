@@ -34,10 +34,83 @@ jobs:
 
       - name: Install System Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git ffmpeg wget jq
+          set -e
+
+          echo "::group::Configure APT retry/timeouts"
+          sudo tee /etc/apt/apt.conf.d/99-ci-retry.conf > /dev/null <<'EOF'
+          Acquire::Retries "0";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "120";
+          EOF
+          echo "::endgroup::"
+
+          echo "::group::Mirror reachability check"
+          switch_mirror() {
+            echo "Switching sources to https://mirrors.edge.kernel.org/ubuntu ..."
+            # Ubuntu 22.04 / 24.04 (sources.list)
+            if [ -f /etc/apt/sources.list ]; then
+              sudo sed -i \
+                -e 's|http://azure.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                /etc/apt/sources.list
+            fi
+            # Ubuntu 24.04+ deb822 format
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i \
+                -e 's|http://azure.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+                /etc/apt/sources.list.d/ubuntu.sources
+            fi
+          }
+
+          # Probe each default host; if any fails, switch to kernel.org
+          NEED_SWITCH=0
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            if ! getent hosts "$host" > /dev/null 2>&1; then
+              echo "::warning::DNS lookup for $host failed"
+              NEED_SWITCH=1
+            fi
+          done
+          if [ "$NEED_SWITCH" -eq 1 ]; then
+            switch_mirror
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Install packages with retry"
+          MAX_ATTEMPTS=4
+          ATTEMPT=1
+          INSTALL_OK=0
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            echo "--- Attempt $ATTEMPT / $MAX_ATTEMPTS ---"
+            if sudo apt-get update \
+               && sudo apt-get install -y --no-install-recommends git ffmpeg wget jq; then
+              INSTALL_OK=1
+              break
+            fi
+            echo "::warning::APT attempt $ATTEMPT failed. Retrying in $((ATTEMPT * 10))s ..."
+            sleep $((ATTEMPT * 10))
+            # On the 2nd failure, force the fallback mirror as well
+            if [ "$ATTEMPT" -ge 2 ] && [ "$NEED_SWITCH" -eq 0 ]; then
+              echo "::warning::Forcing mirror switch after repeated failures."
+              switch_mirror
+              NEED_SWITCH=1
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          if [ "$INSTALL_OK" -ne 1 ]; then
+            echo "::error::APT install failed after $MAX_ATTEMPTS attempts."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Python & Node deps"
           pip install requests > /dev/null 2>&1
           npm install googleapis axios form-data nodemailer > /dev/null 2>&1
+          echo "::endgroup::"
 
       - name: Download and Reassemble Video Chunks
         env:
@@ -79,7 +152,7 @@ jobs:
           for url in "${URL_ARRAY[@]}"; do
             part_name=$(basename "$url")
             echo "Downloading: $part_name"
-            wget --no-verbose -O "downloads/$part_name" "$url"
+            wget --no-verbose --tries=3 --timeout=30 -O "downloads/$part_name" "$url"
           done
 
           echo "Combining video chunks..."
@@ -87,9 +160,6 @@ jobs:
 
           rm -f "$TARGET_FILENAME"
 
-          # ---- Build the list of files to concatenate ----
-          # If any file name contains "part", treat them as the chunks.
-          # Otherwise (single-file payload, e.g. 2151bdc7.mp4), use everything.
           if ls -1 | grep -q "part"; then
             FILES=$(ls -v | grep "part")
           else
@@ -102,7 +172,6 @@ jobs:
             exit 1
           fi
 
-          # Concatenate in version-sorted order; skip the target if it already exists
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             [ "$f" = "$TARGET_FILENAME" ] && continue
@@ -133,22 +202,44 @@ jobs:
           const { google } = require("googleapis");
 
           // ---------- MEGA fallback ----------
-          function installMegaCmd() {
-            try {
-              execSync("which mega-login", { stdio: "ignore" });
-              return;
-            } catch (e) {}
+          function runSafe(cmd) {
+            try { execSync(cmd, { stdio: "ignore" }); return true; }
+            catch (e) { return false; }
+          }
 
-            execSync(
-              "wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O /tmp/megacmd.deb",
-              { stdio: "ignore" }
-            );
-            execSync("sudo apt-get install -y /tmp/megacmd.deb > /dev/null 2>&1", { stdio: "ignore" });
-            execSync("rm -f /tmp/megacmd.deb", { stdio: "ignore" });
+          function installMegaCmd() {
+            if (runSafe("which mega-login")) return true;
+
+            const MEGA_DEB = "/tmp/megacmd.deb";
+            const MEGA_URL =
+              "https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb";
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                console.log(`Downloading megacmd (attempt ${attempt}) ...`);
+                execSync(
+                  `wget --no-verbose --tries=2 --timeout=30 -O ${MEGA_DEB} ${MEGA_URL}`,
+                  { stdio: "ignore" }
+                );
+                execSync(`sudo apt-get install -y ${MEGA_DEB} > /dev/null 2>&1`, {
+                  stdio: "ignore",
+                });
+                execSync(`rm -f ${MEGA_DEB}`, { stdio: "ignore" });
+                if (runSafe("which mega-login")) return true;
+              } catch (e) {
+                console.log(`megacmd install attempt ${attempt} failed`);
+                try { execSync(`rm -f ${MEGA_DEB}`, { stdio: "ignore" }); } catch (_) {}
+                execSync(`sleep ${attempt * 5}`, { stdio: "ignore" });
+              }
+            }
+            return false;
           }
 
           async function uploadToMega(filePath) {
-            installMegaCmd();
+            if (!installMegaCmd()) {
+              console.log("megacmd unavailable, skipping MEGA fallback");
+              return;
+            }
 
             const megaAccounts = [
               { email: process.env.MEGA_EMAIL, pass: process.env.MEGA_PASSWORD },
@@ -163,13 +254,15 @@ jobs:
             for (let i = 0; i < megaAccounts.length; i++) {
               const acc = megaAccounts[i];
               try {
-                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                runSafe("mega-logout");
                 execSync(`mega-login "${acc.email}" "${acc.pass}"`, { stdio: "ignore" });
                 execSync(`mega-put "${filePath}" /`, { stdio: "ignore" });
-                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                runSafe("mega-logout");
+                console.log(`MEGA upload succeeded on account #${i + 1}`);
                 return;
               } catch (err) {
-                try { execSync("mega-logout", { stdio: "ignore" }); } catch (e) {}
+                runSafe("mega-logout");
+                console.log(`MEGA account #${i + 1} failed, trying next`);
               }
             }
           }
@@ -231,7 +324,7 @@ jobs:
               await transporter.sendMail({
                 from: gmailUser,
                 to: emailTo,
-                subject: `Video Fallback Upload – ${fileName}`,
+                subject: `Video Fallback Upload - ${fileName}`,
                 text:
                   `YouTube upload failed, but the video was uploaded to Gofile.\n\n` +
                   `File      : ${fileName}\n` +
@@ -240,8 +333,9 @@ jobs:
                   `Link      : ${downloadPage}\n\n` +
                   `You can re-download the video from the link above.\n`,
               });
+              console.log("Fallback email sent to", emailTo);
             } catch (err) {
-              // swallow email errors
+              console.log("Fallback email failed:", err.message);
             }
           }
 
@@ -253,8 +347,10 @@ jobs:
 
             const filePath = path.join(__dirname, "downloads", process.env.TARGET_FILENAME || "");
             const fileSize = fs.statSync(filePath).size;
+            console.log(`Video size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
 
             if (!clientId || !clientSecret || !refreshToken) {
+              console.log("YouTube credentials missing; using fallbacks");
               await uploadToMega(filePath);
               await uploadToGofileAndEmail(filePath);
               return;
@@ -278,17 +374,20 @@ jobs:
                   },
                   media: { body: fs.createReadStream(filePath) },
                 },
-                {
-                  onUploadProgress: () => {},
-                }
+                { onUploadProgress: () => {} }
               );
+              console.log("YouTube upload succeeded");
             } catch (error) {
+              console.log("YouTube upload failed:", error.message);
               await uploadToMega(filePath);
               await uploadToGofileAndEmail(filePath);
             }
           }
 
-          uploadVideo();
+          uploadVideo().catch(err => {
+            console.error("Fatal error:", err);
+            process.exit(1);
+          });
           '
 
       - name: Cleanup GitHub Release
