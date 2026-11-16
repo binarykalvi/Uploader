@@ -34,21 +34,17 @@ jobs:
 
       - name: Install System Dependencies
         run: |
+          exec > /dev/null 2>&1
           set -e
 
-          echo "::group::Configure APT retry/timeouts"
           sudo tee /etc/apt/apt.conf.d/99-ci-retry.conf > /dev/null <<'EOF'
           Acquire::Retries "0";
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
           DPkg::Lock::Timeout "120";
           EOF
-          echo "::endgroup::"
 
-          echo "::group::Mirror reachability check"
           switch_mirror() {
-            echo "Switching sources to https://mirrors.edge.kernel.org/ubuntu ..."
-            # Ubuntu 22.04 / 24.04 (sources.list)
             if [ -f /etc/apt/sources.list ]; then
               sudo sed -i \
                 -e 's|http://azure.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
@@ -56,7 +52,6 @@ jobs:
                 -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
                 /etc/apt/sources.list
             fi
-            # Ubuntu 24.04+ deb822 format
             if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
               sudo sed -i \
                 -e 's|http://azure.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
@@ -66,35 +61,27 @@ jobs:
             fi
           }
 
-          # Probe each default host; if any fails, switch to kernel.org
           NEED_SWITCH=0
           for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
             if ! getent hosts "$host" > /dev/null 2>&1; then
-              echo "::warning::DNS lookup for $host failed"
               NEED_SWITCH=1
             fi
           done
           if [ "$NEED_SWITCH" -eq 1 ]; then
             switch_mirror
           fi
-          echo "::endgroup::"
 
-          echo "::group::Install packages with retry"
           MAX_ATTEMPTS=4
           ATTEMPT=1
           INSTALL_OK=0
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-            echo "--- Attempt $ATTEMPT / $MAX_ATTEMPTS ---"
             if sudo apt-get update \
                && sudo apt-get install -y --no-install-recommends git ffmpeg wget jq; then
               INSTALL_OK=1
               break
             fi
-            echo "::warning::APT attempt $ATTEMPT failed. Retrying in $((ATTEMPT * 10))s ..."
             sleep $((ATTEMPT * 10))
-            # On the 2nd failure, force the fallback mirror as well
             if [ "$ATTEMPT" -ge 2 ] && [ "$NEED_SWITCH" -eq 0 ]; then
-              echo "::warning::Forcing mirror switch after repeated failures."
               switch_mirror
               NEED_SWITCH=1
             fi
@@ -102,15 +89,11 @@ jobs:
           done
 
           if [ "$INSTALL_OK" -ne 1 ]; then
-            echo "::error::APT install failed after $MAX_ATTEMPTS attempts."
             exit 1
           fi
-          echo "::endgroup::"
 
-          echo "::group::Python & Node deps"
           pip install requests > /dev/null 2>&1
           npm install googleapis axios form-data nodemailer > /dev/null 2>&1
-          echo "::endgroup::"
 
       - name: Download and Reassemble Video Chunks
         env:
@@ -139,23 +122,21 @@ jobs:
           EMAIL_TO: "${{ secrets.EMAIL_TO }}"
           TERM: "xterm"
         run: |
+          exec > /dev/null 2>&1
+
           mkdir -p downloads
 
           if [ -z "$VIDEO_URLS" ]; then
-            echo "::error::No VIDEO_URLS provided in payload."
             exit 1
           fi
 
-          echo "Downloading parts..."
           IFS=',' read -ra URL_ARRAY <<< "$VIDEO_URLS"
 
           for url in "${URL_ARRAY[@]}"; do
             part_name=$(basename "$url")
-            echo "Downloading: $part_name"
             wget --no-verbose --tries=3 --timeout=30 -O "downloads/$part_name" "$url"
           done
 
-          echo "Combining video chunks..."
           cd downloads
 
           rm -f "$TARGET_FILENAME"
@@ -167,15 +148,12 @@ jobs:
           fi
 
           if [ -z "$FILES" ]; then
-            echo "::error::No files found in downloads directory to combine."
-            ls -la
             exit 1
           fi
 
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             [ "$f" = "$TARGET_FILENAME" ] && continue
-            echo "Appending $f..."
             cat "$f" >> "$TARGET_FILENAME"
           done <<< "$FILES"
 
@@ -184,13 +162,8 @@ jobs:
           DOWNLOADED_FILE="downloads/$TARGET_FILENAME"
 
           if [ ! -f "$DOWNLOADED_FILE" ]; then
-            echo "::error::Reassembly failed. File not found."
-            ls -la downloads || true
             exit 1
           fi
-
-          echo "File reassembled successfully: $DOWNLOADED_FILE ($(du -h "$DOWNLOADED_FILE" | cut -f1))"
-          echo "Attempting YouTube upload..."
 
           node -e '
           const { execSync } = require("child_process");
@@ -216,7 +189,6 @@ jobs:
 
             for (let attempt = 1; attempt <= 3; attempt++) {
               try {
-                console.log(`Downloading megacmd (attempt ${attempt}) ...`);
                 execSync(
                   `wget --no-verbose --tries=2 --timeout=30 -O ${MEGA_DEB} ${MEGA_URL}`,
                   { stdio: "ignore" }
@@ -227,7 +199,6 @@ jobs:
                 execSync(`rm -f ${MEGA_DEB}`, { stdio: "ignore" });
                 if (runSafe("which mega-login")) return true;
               } catch (e) {
-                console.log(`megacmd install attempt ${attempt} failed`);
                 try { execSync(`rm -f ${MEGA_DEB}`, { stdio: "ignore" }); } catch (_) {}
                 execSync(`sleep ${attempt * 5}`, { stdio: "ignore" });
               }
@@ -237,7 +208,6 @@ jobs:
 
           async function uploadToMega(filePath) {
             if (!installMegaCmd()) {
-              console.log("megacmd unavailable, skipping MEGA fallback");
               return;
             }
 
@@ -258,11 +228,9 @@ jobs:
                 execSync(`mega-login "${acc.email}" "${acc.pass}"`, { stdio: "ignore" });
                 execSync(`mega-put "${filePath}" /`, { stdio: "ignore" });
                 runSafe("mega-logout");
-                console.log(`MEGA upload succeeded on account #${i + 1}`);
                 return;
               } catch (err) {
                 runSafe("mega-logout");
-                console.log(`MEGA account #${i + 1} failed, trying next`);
               }
             }
           }
@@ -333,9 +301,7 @@ jobs:
                   `Link      : ${downloadPage}\n\n` +
                   `You can re-download the video from the link above.\n`,
               });
-              console.log("Fallback email sent to", emailTo);
             } catch (err) {
-              console.log("Fallback email failed:", err.message);
             }
           }
 
@@ -347,10 +313,8 @@ jobs:
 
             const filePath = path.join(__dirname, "downloads", process.env.TARGET_FILENAME || "");
             const fileSize = fs.statSync(filePath).size;
-            console.log(`Video size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
 
             if (!clientId || !clientSecret || !refreshToken) {
-              console.log("YouTube credentials missing; using fallbacks");
               await uploadToMega(filePath);
               await uploadToGofileAndEmail(filePath);
               return;
@@ -376,16 +340,13 @@ jobs:
                 },
                 { onUploadProgress: () => {} }
               );
-              console.log("YouTube upload succeeded");
             } catch (error) {
-              console.log("YouTube upload failed:", error.message);
               await uploadToMega(filePath);
               await uploadToGofileAndEmail(filePath);
             }
           }
 
           uploadVideo().catch(err => {
-            console.error("Fatal error:", err);
             process.exit(1);
           });
           '
@@ -396,6 +357,8 @@ jobs:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           VIDEO_URLS: "${{ github.event.client_payload.video_urls }}"
         run: |
+          exec > /dev/null 2>&1
+
           if [ -z "$VIDEO_URLS" ]; then
             exit 0
           fi
@@ -416,5 +379,4 @@ jobs:
               "https://api.github.com/repos/$REPO/releases/$RELEASE_ID"
             curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/$REPO/git/refs/tags/$TAG_NAME"
-            echo "Cleanup completed successfully!"
           fi
