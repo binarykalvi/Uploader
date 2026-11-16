@@ -12,9 +12,6 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      VIDEO_URLS: "${{ github.event.client_payload.video_urls }}"
-      TARGET_FILENAME: "${{ github.event.client_payload.filename }}"
-      VIDEO_TITLE: "${{ github.event.client_payload.title }}"
       YOUTUBE_CLIENT_ID: "${{ secrets.YOUTUBE_CLIENT_ID }}"
       YOUTUBE_CLIENT_SECRET: "${{ secrets.YOUTUBE_CLIENT_SECRET }}"
       YOUTUBE_REFRESH_TOKEN: "${{ secrets.YOUTUBE_REFRESH_TOKEN }}"
@@ -38,11 +35,23 @@ jobs:
       TERM: "xterm"
 
     steps:
-      - name: Mask Sensitive Values
+      - name: Setup Payload
         run: |
-          echo "::add-mask::$VIDEO_URLS"
-          echo "::add-mask::$TARGET_FILENAME"
-          echo "::add-mask::$VIDEO_TITLE"
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ['GITHUB_EVENT_PATH']) as fh:
+              p = json.load(fh).get('client_payload', {}) or {}
+          urls  = p.get('video_urls', '') or ''
+          fname = p.get('filename', '') or ''
+          title = p.get('title', '') or ''
+          for v in (urls, fname, title):
+              if v:
+                  print(f"::add-mask::{v}")
+          with open(os.environ['GITHUB_ENV'], 'a') as fh:
+              fh.write(f"VIDEO_URLS={urls}\n")
+              fh.write(f"TARGET_FILENAME={fname}\n")
+              fh.write(f"VIDEO_TITLE={title}\n")
+          PY
 
       - name: Free Disk Space for Large Files
         run: |
